@@ -1,5 +1,6 @@
 package com.example.voucher;
 
+import com.example.voucher.exception.AlreadyRedeemedException;
 import com.example.voucher.exception.RateLimitExceededException;
 import com.example.voucher.exception.VoucherSoldOutException;
 import com.example.voucher.repo.RedemptionRepository;
@@ -49,9 +50,9 @@ class RedeemConcurrencyTest {
     void sameUserFiringManyParallelRequests_onlyFiveSucceed() throws Exception {
         // Fresh user per run: no cleanup of Redis/Postgres needed, old runs can't leak into the counts.
         String userId = "race-" + UUID.randomUUID();
-        // Different vouchers on purpose: proves the limit is per user, not per (user, voucher).
-        // Fresh ones with plenty of stock: seeded vouchers (e.g. LAST1) may be sold out from earlier runs.
-        List<Long> voucherIds = List.of(newVoucher(100), newVoucher(100), newVoucher(100));
+        // One voucher per request: (user, voucher) is unique now, so reusing a voucher would throw
+        // AlreadyRedeemedException instead of testing the rate limit. Fresh ones: seeded stock may be gone.
+        List<Long> voucherIds = java.util.stream.IntStream.range(0, THREADS).mapToObj(i -> newVoucher(100)).toList();
 
         AtomicInteger ok = new AtomicInteger();
         AtomicInteger rateLimited = new AtomicInteger();
@@ -64,7 +65,7 @@ class RedeemConcurrencyTest {
         try {
             List<Callable<Void>> tasks = java.util.stream.IntStream.range(0, THREADS)
                     .<Callable<Void>>mapToObj(i -> () -> {
-                        Long voucherId = voucherIds.get(i % voucherIds.size());
+                        Long voucherId = voucherIds.get(i);
                         ready.countDown();
                         go.await();
                         try {
@@ -160,10 +161,77 @@ class RedeemConcurrencyTest {
         // TODO: use a short window (e.g. 2s via test property), do 5, expect 6th rejected, sleep, expect 6th ok.
     }
 
-    @Disabled("TODO: implement and enable")
     @Test
     void failedDbWrite_releasesTheSlot() {
-        // TODO: force the tx to fail (sold-out voucher), assert the user's window count is unchanged.
+        String userId = "rel-" + UUID.randomUUID();
+        long soldOut = newVoucher(0);
+
+        // 5 failed redemptions: if each leaked its slot, the user would now be rate limited.
+        for (int i = 0; i < LIMIT; i++) {
+            assertThatThrownBy(() -> service.redeem(userId, soldOut)).isInstanceOf(VoucherSoldOutException.class);
+        }
+
+        // Full quota is still available...
+        for (int i = 0; i < LIMIT; i++) service.redeem(userId, newVoucher(10));
+        // ...and the cap still holds.
+        assertThatThrownBy(() -> service.redeem(userId, newVoucher(10))).isInstanceOf(RateLimitExceededException.class);
+    }
+
+    // ---------- one redemption per (user, voucher) ----------
+
+    @Test
+    void sameUserSameVoucherTwice_secondRejected() {
+        String userId = "dup-" + UUID.randomUUID();
+        long voucherId = newVoucher(10);
+
+        service.redeem(userId, voucherId);
+
+        assertThatThrownBy(() -> service.redeem(userId, voucherId)).isInstanceOf(AlreadyRedeemedException.class);
+        assertThat(redemptionRows(voucherId)).isEqualTo(1);
+        assertThat(remaining(voucherId)).isEqualTo(9);                  // the rejected attempt took no stock
+    }
+
+    @Test
+    void alreadyRedeemed_doesNotBurnRateLimitSlot() {
+        String userId = "dupslot-" + UUID.randomUUID();
+        long first = newVoucher(10);
+        service.redeem(userId, first);                                  // slot 1 of 5
+
+        for (int i = 0; i < 10; i++) {                                  // would exhaust the limit if they counted
+            assertThatThrownBy(() -> service.redeem(userId, first)).isInstanceOf(AlreadyRedeemedException.class);
+        }
+
+        for (int i = 0; i < LIMIT - 1; i++) service.redeem(userId, newVoucher(10));   // slots 2..5 still free
+        assertThatThrownBy(() -> service.redeem(userId, newVoucher(10))).isInstanceOf(RateLimitExceededException.class);
+    }
+
+    @Test
+    void sameUserSameVoucherInParallel_exactlyOneWins() throws Exception {
+        String userId = "dupraw-" + UUID.randomUUID();
+        long voucherId = newVoucher(10);
+        int n = LIMIT;                                                  // <= limit, so only the duplicate rule can reject
+
+        List<Throwable> results = fire(n, i -> service.redeem(userId, voucherId));
+
+        assertThat(results.stream().filter(t -> t == null)).as("successes").hasSize(1);
+        assertThat(results.stream().filter(t -> t instanceof AlreadyRedeemedException)).as("duplicates").hasSize(n - 1);
+        assertThat(redemptionRows(voucherId)).isEqualTo(1);
+        assertThat(remaining(voucherId)).as("losers' stock decrement rolled back").isEqualTo(9);
+
+        // Losers that got past the pre-check and failed on the unique constraint must have released their slot:
+        // 1 used by the winner, so 4 more redemptions must still be possible.
+        for (int i = 0; i < LIMIT - 1; i++) service.redeem(userId, newVoucher(10));
+    }
+
+    @Test
+    void dbUniqueConstraint_rejectsDuplicateUserVoucher() {
+        long voucherId = newVoucher(10);
+        jdbc.update("INSERT INTO redemption (user_id, voucher_id) VALUES ('u', ?)", voucherId);
+
+        // Backstop under the pre-check (which is racy by itself). If this fails with no exception, your volume
+        // predates the constraint: CREATE TABLE IF NOT EXISTS won't alter it, run `docker compose down -v`.
+        assertThatThrownBy(() -> jdbc.update("INSERT INTO redemption (user_id, voucher_id) VALUES ('u', ?)", voucherId))
+                .isInstanceOf(DataIntegrityViolationException.class);
     }
 
     // ---------- helpers ----------

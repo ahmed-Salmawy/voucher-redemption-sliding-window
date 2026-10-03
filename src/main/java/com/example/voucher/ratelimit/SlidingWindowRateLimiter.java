@@ -1,5 +1,6 @@
 package com.example.voucher.ratelimit;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -16,12 +17,14 @@ import java.util.UUID;
  * Key per user: rl:redeem:{userId}, score = epoch millis, member = unique token.
  */
 @Component
+@Slf4j
 public class SlidingWindowRateLimiter {
 
     private final StringRedisTemplate redis;
     private final int max;
     private final Duration window;
     private final DefaultRedisScript<Long> script;
+    private final String KEY_FORMAT = "rl:redeem:%s";
 
     public SlidingWindowRateLimiter(StringRedisTemplate redis,
                                     @Value("${voucher.rate-limit.max-redemptions}") int max,
@@ -53,7 +56,7 @@ public class SlidingWindowRateLimiter {
         var token = UUID.randomUUID().toString();
         Long result = redis.execute(
                 script,
-                List.of("rl:redeem:" + userId),
+                List.of(KEY_FORMAT.formatted(userId)),
                 String.valueOf(window.toMillis()),
                 String.valueOf(max),
                 token
@@ -65,9 +68,16 @@ public class SlidingWindowRateLimiter {
     /**
      * Give a slot back (ZREM the token). Used when the DB part of a redemption fails after the
      * slot was already taken, so a failed redemption doesn't burn the user's quota.
-     * TODO: implement. Is this compensation itself allowed to fail? What then?
+     *
      */
     public void release(String userId, String token) {
-        throw new UnsupportedOperationException("TODO");
+        try {
+
+            var key = KEY_FORMAT.formatted(userId);
+            var updated = redis.opsForZSet().remove(key, token);
+            log.debug("Removed token {} ,from user {}, count is  {}", token, key, updated);
+        } catch (Exception e) {
+            log.error("failed to remove token {} for user{} cause", e, token, userId);
+        }
     }
 }

@@ -11,9 +11,8 @@ CREATE TABLE IF NOT EXISTS redemption (
     id          BIGSERIAL PRIMARY KEY,
     user_id     VARCHAR(64) NOT NULL,
     voucher_id  BIGINT NOT NULL REFERENCES voucher(id),
-    redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    -- TODO: decide: UNIQUE (user_id, voucher_id)? (one redemption per user per voucher) and document why / why not
-);
+    redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_redemption_user_voucher UNIQUE (user_id, voucher_id));
 
 -- TODO: index to support "history of a user" queries, e.g. (user_id, redeemed_at)
 

@@ -6,7 +6,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.util.Optional;
 
 public interface RedemptionRepository extends JpaRepository<Redemption, Long> {
     // TODO (optional): count by user within last hour - used ONLY to cross-check Redis in tests,
@@ -25,5 +25,5 @@ public interface RedemptionRepository extends JpaRepository<Redemption, Long> {
     );
 
 
-
+    Optional<Redemption> findByUserIdAndVoucherId(String userId, Long voucherId);
 }

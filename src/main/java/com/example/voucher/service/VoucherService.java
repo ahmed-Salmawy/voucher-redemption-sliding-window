@@ -3,13 +3,15 @@ package com.example.voucher.service;
 import com.example.voucher.concurrency.UserLockRegistry;
 import com.example.voucher.domain.Redemption;
 import com.example.voucher.domain.Voucher;
+import com.example.voucher.exception.AlreadyRedeemedException;
 import com.example.voucher.exception.RateLimitExceededException;
 import com.example.voucher.exception.VoucherSoldOutException;
 import com.example.voucher.ratelimit.SlidingWindowRateLimiter;
 import com.example.voucher.repo.RedemptionRepository;
 import com.example.voucher.repo.VoucherRepository;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
@@ -63,17 +65,50 @@ public class VoucherService {
      * TODO: implement. Then answer in README: is the JVM lock even needed given the Lua script is atomic?
      */
     public void redeem(String userId, Long voucherId) {
+        if (redemptions.findByUserIdAndVoucherId(userId, voucherId).isPresent()) {
+            throw new AlreadyRedeemedException("Voucher Already redeemed once.");
+        }
+        String token = limiter.tryAcquire(userId)
+                .orElseThrow(() ->
+                        new RateLimitExceededException("Redemption limit reached"));
+        try {
+            transactionTemplate.executeWithoutResult(transactionStatus -> {
 
-        if (limiter.tryAcquire(userId).isEmpty()) {
-            throw new RateLimitExceededException("Redemption limit reached, try again later");
+                int updatedCount = vouchers.decrementStock(voucherId);
+                if (updatedCount == 0) {
+                    throw new VoucherSoldOutException();
+                }
+                redemptions.save(new Redemption(userId, voucherId));
+
+            });
+
+        } catch (DataIntegrityViolationException ex) {
+            limiter.release(userId, token);
+            if (isConstraint(ex, "uq_redemption_user_voucher"))
+                throw new AlreadyRedeemedException("Voucher already redeemed");
+
+            throw ex;
+        } catch (RuntimeException runtimeException) {
+            limiter.release(userId, token);
+            throw runtimeException;
         }
 
-        transactionTemplate.executeWithoutResult(transactionStatus -> {
-            int count = vouchers.decrementStock(voucherId);
-            if(count == 0){
-                throw new VoucherSoldOutException();
+    }
+
+
+    private boolean isConstraint(Throwable error, String constraintName) {
+        Throwable current = error;
+
+        while (current != null) {
+            if (current instanceof
+                    ConstraintViolationException violation
+                    && constraintName.equals(violation.getConstraintName())) {
+                return true;
             }
-            redemptions.save(new Redemption(userId, voucherId));
-        });
+
+            current = current.getCause();
+        }
+
+        return false;
     }
 }
