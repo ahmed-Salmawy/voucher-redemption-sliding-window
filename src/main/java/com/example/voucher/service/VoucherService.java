@@ -1,13 +1,18 @@
 package com.example.voucher.service;
 
 import com.example.voucher.concurrency.UserLockRegistry;
+import com.example.voucher.domain.Redemption;
 import com.example.voucher.domain.Voucher;
+import com.example.voucher.exception.RateLimitExceededException;
 import com.example.voucher.ratelimit.SlidingWindowRateLimiter;
 import com.example.voucher.repo.RedemptionRepository;
 import com.example.voucher.repo.VoucherRepository;
-import java.util.List;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
 
 @Service
 public class VoucherService {
@@ -35,27 +40,34 @@ public class VoucherService {
 
     /**
      * Intended flow (ORDER MATTERS - reason about each step in the README):
-     *
-     *   locks.withLock(userId, () -> {
-     *       1. token = limiter.tryAcquire(userId)          -> empty => throw RateLimitExceededException
-     *       2. try {
-     *              tx.execute(...) {                        -> programmatic tx, NOT @Transactional on this method
-     *                  rows = vouchers.decrementStock(id)   -> 0 => throw VoucherSoldOutException
-     *                  redemptions.save(new Redemption(userId, id))
-     *              }
-     *          } catch (RuntimeException e) {
-     *              limiter.release(userId, token);          -> failed redeem must not burn quota
-     *              throw e;
-     *          }
-     *   });
-     *
+     * <p>
+     * locks.withLock(userId, () -> {
+     * 1. token = limiter.tryAcquire(userId)          -> empty => throw RateLimitExceededException
+     * 2. try {
+     * tx.execute(...) {                        -> programmatic tx, NOT @Transactional on this method
+     * rows = vouchers.decrementStock(id)   -> 0 => throw VoucherSoldOutException
+     * redemptions.save(new Redemption(userId, id))
+     * }
+     * } catch (RuntimeException e) {
+     * limiter.release(userId, token);          -> failed redeem must not burn quota
+     * throw e;
+     * }
+     * });
+     * <p>
      * Why programmatic tx: the lock must be released AFTER commit. With @Transactional on the
      * method the commit happens after the method returns, i.e. after the lock is released, and
      * a second thread can enter before the first one's row is visible.
-     *
+     * <p>
      * TODO: implement. Then answer in README: is the JVM lock even needed given the Lua script is atomic?
      */
     public void redeem(String userId, Long voucherId) {
-        throw new UnsupportedOperationException("TODO");
+        Instant cutoff = Instant.now().minus(60, ChronoUnit.MINUTES);
+
+        if (redemptions.countByUserIdSince(userId, cutoff) >= 5) {
+            throw new RateLimitExceededException("Redemption limit reached (5 per hour)");
+        }
+        redemptions.save(new Redemption(userId, voucherId));
+
+
     }
 }

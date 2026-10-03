@@ -4,10 +4,11 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
-import java.time.Instant;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+
+import java.time.Instant;
 
 @Entity
 @Getter
@@ -20,5 +21,8 @@ public class Redemption {
     private Long voucherId;
     private Instant redeemedAt = Instant.now();
 
-    // TODO: constructor (userId, voucherId)
+    public Redemption(String userId, Long voucherId) {
+        this.userId = userId;
+        this.voucherId = voucherId;
+    }
 }
