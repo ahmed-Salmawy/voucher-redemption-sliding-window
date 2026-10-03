@@ -1,15 +1,27 @@
 -- Sliding window LOG rate limiter (Redis ZSET).
 -- KEYS[1] = rl:redeem:{userId}
--- ARGV[1] = now (epoch millis)
--- ARGV[2] = window (millis)
--- ARGV[3] = max allowed in window
--- ARGV[4] = unique member for this request (so two requests in the same millis don't collapse)
+-- ARGV[1] = window (millis)
+-- ARGV[2] = max allowed in window
+-- ARGV[3] = unique member for this request (so two requests in the same millis don't collapse)
+-- "now" is read from Redis TIME, so all app instances share one clock.
 -- Returns: 1 if allowed (and recorded), 0 if rejected.
---
--- TODO (you):
---   1. ZREMRANGEBYSCORE: drop entries older than now - window
---   2. ZCARD: count what is left
---   3. if count < max: ZADD now/member, PEXPIRE key window (so idle users don't leak memory), return 1
---   4. else return 0
--- Think: why must these 4 steps be one atomic script rather than 4 client calls?
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local max = tonumber(ARGV[2])
+local member = ARGV[3]
+
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+
+-- 1. drop entries older than now - window
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+-- 2. count what is left
+local count = redis.call('ZCARD', key)
+-- 3. under the limit: record this request, refresh TTL so idle users don't leak memory
+if count < max then
+    redis.call('ZADD', key, now, member)
+    redis.call('PEXPIRE', key, window)
+    return 1
+end
+-- 4. over the limit
 return 0

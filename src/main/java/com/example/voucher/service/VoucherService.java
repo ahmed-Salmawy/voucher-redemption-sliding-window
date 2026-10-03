@@ -61,10 +61,9 @@ public class VoucherService {
      * TODO: implement. Then answer in README: is the JVM lock even needed given the Lua script is atomic?
      */
     public void redeem(String userId, Long voucherId) {
-        Instant cutoff = Instant.now().minus(60, ChronoUnit.MINUTES);
 
-        if (redemptions.countByUserIdSince(userId, cutoff) >= 5) {
-            throw new RateLimitExceededException("Redemption limit reached (5 per hour)");
+        if (limiter.tryAcquire(userId).isEmpty()) {
+            throw new RateLimitExceededException("Redemption limit reached, try again later");
         }
         redemptions.save(new Redemption(userId, voucherId));
 
