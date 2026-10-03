@@ -1,0 +1,15 @@
+-- Sliding window LOG rate limiter (Redis ZSET).
+-- KEYS[1] = rl:redeem:{userId}
+-- ARGV[1] = now (epoch millis)
+-- ARGV[2] = window (millis)
+-- ARGV[3] = max allowed in window
+-- ARGV[4] = unique member for this request (so two requests in the same millis don't collapse)
+-- Returns: 1 if allowed (and recorded), 0 if rejected.
+--
+-- TODO (you):
+--   1. ZREMRANGEBYSCORE: drop entries older than now - window
+--   2. ZCARD: count what is left
+--   3. if count < max: ZADD now/member, PEXPIRE key window (so idle users don't leak memory), return 1
+--   4. else return 0
+-- Think: why must these 4 steps be one atomic script rather than 4 client calls?
+return 0
