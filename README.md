@@ -13,13 +13,14 @@ The point is not the CRUD. It is to show that I understand *why* this is harder 
 
 ## 1. The problem, conceptually
 
-Three things must hold at once, and each one fails in a different way under load:
+Four things must hold at once, and each one fails in a different way under load:
 
 | Invariant | How it breaks | Where I defend it |
 |---|---|---|
-| A user never exceeds 5 redemptions per rolling hour | N parallel requests all read "4 so far" and all proceed (check-then-act race) | Redis atomic script + per-user JVM lock |
+| A user never exceeds 5 redemptions per rolling hour | N parallel requests all read "4 so far" and all proceed (check-then-act race) | Redis atomic Lua script (shared by every instance) |
 | A voucher is never oversold | Two users read `remaining = 1` and both decrement | Postgres conditional `UPDATE ... WHERE remaining > 0` + `CHECK (remaining >= 0)` |
-| A failed redemption doesn't burn quota | Slot taken in Redis, then the DB write fails | Compensation: `release` the slot |
+| A user redeems a given voucher at most once | A double-click / retry sends the same voucher twice at the same instant; both pass any check done in Java | `UNIQUE (user_id, voucher_id)` in Postgres, plus a cheap pre-check in Java as a fast path only |
+| A failed redemption doesn't burn quota | Slot taken in Redis, then the DB write fails | Compensation: `release` the slot (a failing release is logged and ignored, the original error wins) |
 
 ## 2. Why a *sliding* window
 
@@ -47,39 +48,54 @@ would switch to the weighted counter and accept the approximation.
 add. Four separate client calls reintroduce the exact race we are trying to remove (a `MULTI/EXEC`
 can't help either, since the `ZCARD` result must influence the `ZADD`).
 
-## 3. Concurrency: the JVM layer
+## 3. Concurrency: where does the guarantee have to live?
 
-`UserLockRegistry` gives **per-user mutual exclusion inside one JVM** using striped `ReentrantLock`s
-(fixed array, `hash(userId) % 256`; bounded memory, no eviction problem).
+The service is meant to run as many identical instances behind a load balancer. That one assumption
+decides where every guarantee can live: **anything kept in one instance's memory is invisible to the
+other instances, so it cannot be the thing that makes an invariant true.**
 
 Order of operations in `VoucherService.redeem`:
 
 ```
-lock(user) {
-    token = limiter.tryAcquire(user)        // Redis, atomic
-    try { tx { decrementStock; insert redemption } }   // Postgres, commit happens INSIDE the lock
-    catch { limiter.release(user, token); throw }
-}
+pre-check: already redeemed?          // Postgres read, fast path only
+token = limiter.tryAcquire(user)      // Redis, atomic Lua
+try { tx { decrementStock; insert redemption } }   // Postgres; Redis call kept OUTSIDE the tx
+catch { limiter.release(user, token); throw }      // failure to release is logged and ignored
 ```
 
-Design points I want to be able to defend:
+### What already works with any number of instances
+Each invariant is decided in a store every instance shares:
+- rate limit: Redis Lua script (check and record in one atomic step)
+- stock: Postgres conditional `UPDATE`, the affected-row count says who won
+- once per voucher: the unique constraint, the only place that sees *all* the requests
 
-- **The lock must wrap the transaction, not the other way round.** With `@Transactional` on the
-  method, commit happens after return, i.e. after the lock is released; another thread can enter
-  before the first one's data is visible. Hence `TransactionTemplate`.
-- **Is the JVM lock redundant given the atomic Lua script?** For the rate limit alone, yes: the script
-  is already linearizable. The lock adds value by serializing the *whole* acquire -> DB -> compensate
-  sequence per user, so that the compensation in the failure path can't interleave with a concurrent
-  attempt for the same user, and it reduces wasted Redis/DB round trips from hot users.
-  I keep it because the brief is to handle concurrency at JVM level, and I document that it is
-  an optimisation + sequencing guard, not the source of correctness.
-- **Limits of a JVM lock:** it protects one process. Behind a load balancer with N instances, two
-  requests from the same user can land on different JVMs. Correctness there comes from the layers
-  below (Redis script for the rate limit, Postgres row update for stock). A distributed lock
-  (Redisson / `SET NX PX`) would be the next step, with its own failure modes (expiry while holding, fencing tokens).
-- **Stock is not protected by the JVM lock** (it's per *user*, stock is contended across users). That
-  is Postgres' job: `UPDATE voucher SET remaining = remaining - 1 WHERE id = ? AND remaining > 0`
-  is atomic and tells me via the affected-row count whether I won.
+None of these depend on how many instances exist, which is why the tests stay green regardless.
+
+### Why I did not build a per-user JVM lock
+I considered a per-user JVM lock (striped `ReentrantLock`s) to make one user's requests take turns.
+Its only real benefit is that a duplicate arriving on the *same* instance waits for the first to commit,
+so its pre-check finds the row and it never takes a Redis slot, opens a transaction or touches the stock row.
+
+I decided against it because:
+- **It guarantees nothing.** Correctness already comes from Lua, the stock `UPDATE` and the unique constraint.
+- **Its benefit shrinks as I scale.** With random load balancing across N instances, two simultaneous
+  requests from one user share an instance roughly 1 time in N. It quietly stops doing what it was added for.
+- **It has its own costs:** requests wait on each other, unrelated users share a stripe, and the lock is
+  held across slow Redis/Postgres calls.
+
+### The problem it would not have solved
+A user's duplicates (or any request that later fails) hold Redis slots while they are in flight. If the user
+is near the limit, a legitimate request arriving at that moment is refused with 429, although a moment later
+(after `release`) there would have been room. Nothing is corrupted, but the decision depended on arrival timing.
+This still happens across instances, so **any real fix has to live in the shared stores (Redis / Postgres)**,
+not in JVM memory. Candidates, none built: a Postgres advisory lock per user inside the transaction,
+a distributed Redis lock (expiry / fencing-token pitfalls), reserve-then-confirm entries in Redis,
+or accepting the rare false 429 and returning `Retry-After`.
+
+### Other points I can defend
+- **Redis call outside the transaction:** otherwise a slow Redis keeps a Postgres connection checked out
+  and exhausts the pool, turning a Redis problem into a database problem.
+- **Stock is not per-user**, so no per-user lock could protect it anyway. That is Postgres' job.
 
 ## 4. Failure modes & trade-offs (to discuss)
 
@@ -114,8 +130,7 @@ curl -X POST -H 'X-User-Id: alice' localhost:8080/vouchers/1/redeem
 ```
 ratelimit/SlidingWindowRateLimiter   Redis ZSET + Lua, tryAcquire / release
 resources/scripts/sliding_window.lua the atomic script
-concurrency/UserLockRegistry         striped per-user locks
-service/VoucherService               orchestration: lock -> limiter -> tx -> compensate
+service/VoucherService               orchestration: pre-check -> limiter -> tx -> compensate
 repo/VoucherRepository               atomic stock decrement
 schema.sql                           explicit constraints (CHECK, FK, indexes)
 test/RedeemConcurrencyTest           the proof: parallel hammering, assertions on invariants
@@ -125,7 +140,6 @@ test/RedeemConcurrencyTest           the proof: parallel hammering, assertions o
 
 - [ ] Lua script
 - [ ] `SlidingWindowRateLimiter` (`tryAcquire`, `release`)
-- [ ] `UserLockRegistry.withLock`
 - [ ] `VoucherRepository.decrementStock`, `VoucherService.list/redeem`
 - [ ] Exceptions + HTTP mapping (429 / 409)
 - [ ] Concurrency tests green (5-of-50, last-voucher, sliding, compensation)

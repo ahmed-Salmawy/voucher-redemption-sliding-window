@@ -1,6 +1,5 @@
 package com.example.voucher.service;
 
-import com.example.voucher.concurrency.UserLockRegistry;
 import com.example.voucher.domain.Redemption;
 import com.example.voucher.domain.Voucher;
 import com.example.voucher.exception.AlreadyRedeemedException;
@@ -22,17 +21,15 @@ public class VoucherService {
     private final VoucherRepository vouchers;
     private final RedemptionRepository redemptions;
     private final SlidingWindowRateLimiter limiter;
-    private final UserLockRegistry locks;
     private final TransactionTemplate tx;
     private final TransactionTemplate transactionTemplate;
 
     public VoucherService(VoucherRepository vouchers, RedemptionRepository redemptions,
-                          SlidingWindowRateLimiter limiter, UserLockRegistry locks,
+                          SlidingWindowRateLimiter limiter,
                           TransactionTemplate tx, TransactionTemplate transactionTemplate) {
         this.vouchers = vouchers;
         this.redemptions = redemptions;
         this.limiter = limiter;
-        this.locks = locks;
         this.tx = tx;
         this.transactionTemplate = transactionTemplate;
     }
@@ -43,26 +40,11 @@ public class VoucherService {
     }
 
     /**
-     * Intended flow (ORDER MATTERS - reason about each step in the README):
-     * <p>
-     * locks.withLock(userId, () -> {
-     * 1. token = limiter.tryAcquire(userId)          -> empty => throw RateLimitExceededException
-     * 2. try {
-     * tx.execute(...) {                        -> programmatic tx, NOT @Transactional on this method
-     * rows = vouchers.decrementStock(id)   -> 0 => throw VoucherSoldOutException
-     * redemptions.save(new Redemption(userId, id))
-     * }
-     * } catch (RuntimeException e) {
-     * limiter.release(userId, token);          -> failed redeem must not burn quota
-     * throw e;
-     * }
-     * });
-     * <p>
-     * Why programmatic tx: the lock must be released AFTER commit. With @Transactional on the
-     * method the commit happens after the method returns, i.e. after the lock is released, and
-     * a second thread can enter before the first one's row is visible.
-     * <p>
-     * TODO: implement. Then answer in README: is the JVM lock even needed given the Lua script is atomic?
+     * Flow (order matters, see README section 3):
+     * 1. pre-check "already redeemed?" (fast path only, the unique constraint is the real guard)
+     * 2. take a slot in Redis (outside the transaction, so no DB connection is held while waiting)
+     * 3. decrement stock + insert redemption in one transaction
+     * 4. on any failure give the slot back; a failing release is logged and ignored
      */
     public void redeem(String userId, Long voucherId) {
         if (redemptions.findByUserIdAndVoucherId(userId, voucherId).isPresent()) {
