@@ -4,14 +4,14 @@ import com.example.voucher.concurrency.UserLockRegistry;
 import com.example.voucher.domain.Redemption;
 import com.example.voucher.domain.Voucher;
 import com.example.voucher.exception.RateLimitExceededException;
+import com.example.voucher.exception.VoucherSoldOutException;
 import com.example.voucher.ratelimit.SlidingWindowRateLimiter;
 import com.example.voucher.repo.RedemptionRepository;
 import com.example.voucher.repo.VoucherRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 
 @Service
@@ -22,15 +22,17 @@ public class VoucherService {
     private final SlidingWindowRateLimiter limiter;
     private final UserLockRegistry locks;
     private final TransactionTemplate tx;
+    private final TransactionTemplate transactionTemplate;
 
     public VoucherService(VoucherRepository vouchers, RedemptionRepository redemptions,
                           SlidingWindowRateLimiter limiter, UserLockRegistry locks,
-                          TransactionTemplate tx) {
+                          TransactionTemplate tx, TransactionTemplate transactionTemplate) {
         this.vouchers = vouchers;
         this.redemptions = redemptions;
         this.limiter = limiter;
         this.locks = locks;
         this.tx = tx;
+        this.transactionTemplate = transactionTemplate;
     }
 
     public List<Voucher> list() {
@@ -65,8 +67,13 @@ public class VoucherService {
         if (limiter.tryAcquire(userId).isEmpty()) {
             throw new RateLimitExceededException("Redemption limit reached, try again later");
         }
-        redemptions.save(new Redemption(userId, voucherId));
 
-
+        transactionTemplate.executeWithoutResult(transactionStatus -> {
+            int count = vouchers.decrementStock(voucherId);
+            if(count == 0){
+                throw new VoucherSoldOutException();
+            }
+            redemptions.save(new Redemption(userId, voucherId));
+        });
     }
 }

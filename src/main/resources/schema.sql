@@ -2,8 +2,9 @@ CREATE TABLE IF NOT EXISTS voucher (
     id        BIGSERIAL PRIMARY KEY,
     code      VARCHAR(64) NOT NULL UNIQUE,
     title     VARCHAR(255) NOT NULL,
-    remaining INT NOT NULL
-    -- TODO: CHECK (remaining >= 0) -- last line of defence against overselling, even if app code is buggy
+    remaining INT NOT NULL,
+    -- last line of defence against overselling, even if app code is buggy
+    CONSTRAINT chk_voucher_remaining_non_negative CHECK (remaining >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS redemption (
